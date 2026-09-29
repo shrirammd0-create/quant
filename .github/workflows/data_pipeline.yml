@@ -1,0 +1,78 @@
+name: Data Pipeline
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+# The only write this workflow does is committing data/*.json back to the repo.
+permissions:
+  contents: write
+
+# One run at a time so two runs can never race on the same push.
+concurrency:
+  group: data-pipeline
+  cancel-in-progress: false
+
+env:
+  DATA_BRANCH: main
+
+jobs:
+  fetch-and-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out data branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DATA_BRANCH }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install requests
+
+      # Each fetch is allowed to fail on its own so one broken source does not block the
+      # other. Failures are surfaced by the final step, after whatever succeeded is pushed.
+      - name: Fetch PAXG order book (Binance)
+        id: paxg
+        continue-on-error: true
+        run: python scripts/fetch_paxg_dom.py
+
+      - name: Fetch XAU_USD order book (OANDA)
+        id: oanda
+        continue-on-error: true
+        env:
+          OANDA_API_KEY: ${{ secrets.OANDA_API_KEY }}
+          OANDA_ACCOUNT_ID: ${{ secrets.OANDA_ACCOUNT_ID }}
+        run: python scripts/fetch_oanda_book.py
+
+      - name: Commit and push updated data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/*.json
+          if git diff --cached --quiet; then
+            echo "No data changes to commit."
+            exit 0
+          fi
+          git commit -m "chore(data): update liquidity data $(date -u +'%Y-%m-%dT%H:%MZ')"
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:${DATA_BRANCH}"; then
+              exit 0
+            fi
+            echo "Push rejected (attempt ${attempt}); rebasing onto origin/${DATA_BRANCH} and retrying."
+            git pull --rebase origin "${DATA_BRANCH}"
+          done
+          echo "Could not push after 3 attempts." >&2
+          exit 1
+
+      - name: Fail the run if any fetch failed
+        if: steps.paxg.outcome == 'failure' || steps.oanda.outcome == 'failure'
+        run: |
+          echo "paxg: ${{ steps.paxg.outcome }}, oanda: ${{ steps.oanda.outcome }}" >&2
+          exit 1
