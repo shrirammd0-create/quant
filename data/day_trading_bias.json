@@ -1,40 +1,40 @@
 {
   "symbol": "PAXGUSDT",
   "source": "https://data-api.binance.vision/api/v3/depth",
-  "generated_at_utc": "2026-10-05T01:04:39Z",
-  "last_update_id": 1636247634,
-  "mid_price": 4164.84,
-  "best_bid": 4164.83,
-  "best_ask": 4164.84,
+  "generated_at_utc": "2026-10-05T06:58:54Z",
+  "last_update_id": 1636711866,
+  "mid_price": 4161.77,
+  "best_bid": 4161.76,
+  "best_ask": 4161.77,
   "range_pct": 0.25,
-  "range_low": 4154.42,
-  "range_high": 4175.25,
+  "range_low": 4151.36,
+  "range_high": 4172.17,
   "range_covered_by_snapshot": true,
-  "bid_volume": 232.8896,
-  "ask_volume": 249.6723,
-  "bid_ask_ratio": 0.9328,
-  "imbalance": -0.0348,
+  "bid_volume": 216.6159,
+  "ask_volume": 179.5065,
+  "bid_ask_ratio": 1.2067,
+  "imbalance": 0.0937,
   "top_liquidity_levels": [
     {
       "rank": 1,
       "side": "bid",
-      "price": 4126.28,
-      "quantity": 121.1943,
-      "distance_pct": -0.9257
+      "price": 4127.0,
+      "quantity": 121.2114,
+      "distance_pct": -0.8353
     },
     {
       "rank": 2,
       "side": "bid",
       "price": 4100.0,
-      "quantity": 109.2296,
-      "distance_pct": -1.5567
+      "quantity": 110.3644,
+      "distance_pct": -1.4841
     },
     {
       "rank": 3,
       "side": "ask",
-      "price": 4192.17,
-      "quantity": 107.6241,
-      "distance_pct": 0.6563
+      "price": 4192.99,
+      "quantity": 95.9076,
+      "distance_pct": 0.7503
     }
   ]
 }
