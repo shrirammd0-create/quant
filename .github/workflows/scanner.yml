@@ -1,0 +1,39 @@
+name: Forex Scanner
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: forex-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        run: python main.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Repository *variables* (Settings > Secrets and variables > Actions > Variables).
+          # Only DATA_BASE_URL is required; the templates default to {pair}_M15.csv / {pair}_D1.csv.
+          DATA_BASE_URL: ${{ vars.DATA_BASE_URL }}
+          M15_FILE_TEMPLATE: ${{ vars.M15_FILE_TEMPLATE }}
+          D1_FILE_TEMPLATE: ${{ vars.D1_FILE_TEMPLATE }}
