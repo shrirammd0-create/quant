@@ -1,99 +1,127 @@
-# xauusd-liquidity-data
+# Forex Market Scanner
 
-An automated data pipeline for gold (XAU/USD) liquidity. Every 15 minutes a GitHub Actions
-workflow pulls two order-book sources, reduces them to a few numbers, and commits the result
-as JSON in `data/`. It only collects data: no trading execution and no signals.
+Scans 28 major and minor currency pairs every 15 minutes and sends **one summarized Telegram message** when any of three quantitative conditions is met. It needs no broker or MetaTrader connection. All data comes from CSV files hosted on GitHub.
 
-| Edge | Source | Script | Output |
-|---|---|---|---|
-| Day trading | Binance PAXG/USDT depth (PAXG tracks spot gold) | `scripts/fetch_paxg_dom.py` | `data/day_trading_bias.json` |
-| Swing trading | OANDA v20 XAU_USD order book | `scripts/fetch_oanda_book.py` | `data/swing_trading_bias.json` |
+| Condition | Triggers when |
+|---|---|
+| **ATR Exhaustion** | Today's high-low range is more than **1.5x** the 14-period daily ATR |
+| **Z-Score Divergence** | The z-score of the 20-bar spread between two correlated pairs is above **+2.0** or below **-2.0** |
+| **Anchored VWAP** | The latest 15-minute close is outside the daily anchored VWAP **+/- 3.0 standard deviation** bands |
 
 ```
-.github/workflows/data_pipeline.yml   cron */15 + manual trigger; runs both scripts, commits data/*.json
-scripts/common.py                     HTTP retries + atomic JSON writes shared by both scripts
-scripts/fetch_paxg_dom.py
-scripts/fetch_oanda_book.py
-data/                                 pipeline output (committed by the workflow)
+data_loader.py   fetch + parse CSVs from a raw.githubusercontent.com URL
+strategies.py    the three conditions
+notifier.py      format the summary and send it through the Telegram Bot API
+http_utils.py    shared HTTP helper: retries, backoff, Retry-After, time limit
+main.py          scan the whole universe, send one message if anything matched
+.github/workflows/scanner.yml   runs main.py on cron */15 * * * *
 ```
 
 ## Setup
 
-1. **Get the code onto `main`.** The workflow checks out and pushes to `main`, and GitHub only
-   runs scheduled workflows from the default branch, so `main` must exist and be the default
-   branch (Settings → Branches).
-2. **Add the OANDA secrets** (Settings → Secrets and variables → Actions → *New repository secret*):
-   - `OANDA_API_KEY`: a personal access token from the OANDA hub (Manage API Access).
-   - `OANDA_ACCOUNT_ID`: e.g. `101-001-1234567-001` (practice) or `001-001-1234567-001` (live).
+### 1. Create the Telegram bot
 
-   The token and account must belong to the same environment. The script uses the account id
-   to choose the API host (ids starting `101-` are practice, everything else is live). Set the
-   environment variable `OANDA_ENV` to `practice` or `live` to override.
-3. **Allow the workflow to push.** The workflow requests `contents: write`. If a push fails with a
-   403, check Settings → Actions → General → *Workflow permissions* is set to *Read and write*.
-   If `main` is protected, the Actions bot must be allowed to push to it.
-4. **Run it once by hand:** Actions → *Data Pipeline* → *Run workflow*. Afterwards `data/` should
-   contain both JSON files and the run should be green.
+1. In Telegram, message [@BotFather](https://t.me/BotFather), send `/newbot` and follow the prompts. It returns the **bot token**.
+2. Send any message to your new bot (for a group: add the bot to the group and post a message).
+3. Open `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates` in a browser. The number at `"chat":{"id": ...}` is your **chat ID**. Group IDs are negative.
 
-The Binance step needs no credentials. The OANDA secrets are exposed only to the OANDA step and
-are never written to the output files or logs.
+### 2. Add the GitHub Secrets
 
-## Output
+In your repository go to **Settings → Secrets and variables → Actions → Secrets → New repository secret** and add:
 
-Both files carry `generated_at_utc`. Consumers should check it, because a failed run leaves the
-previous snapshot in place.
+| Name | Value |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | the token from BotFather |
+| `TELEGRAM_CHAT_ID` | the chat ID from step 1 |
 
-**`day_trading_bias.json`**: `mid_price`, `best_bid`, `best_ask`; `bid_volume` and `ask_volume`
-(PAXG, summed within ±`range_pct` = 0.25% of mid); `bid_ask_ratio` (bid ÷ ask, above 1 means more
-resting buy liquidity); `imbalance` ((bid − ask) ÷ (bid + ask), −1 to +1); and
-`top_liquidity_levels`, the three largest resting orders anywhere in the 1000-level snapshot, with
-`side`, `price`, `quantity` and signed `distance_pct` from mid. `range_covered_by_snapshot` is
-`false` if the snapshot ends inside the ±0.25% band, in which case the volumes are understated.
+### 3. Point it at your CSV data
 
-**`swing_trading_bias.json`**: `target_levels`, the three heaviest stop clusters, each with
-`price` (stop-weighted centre), `price_low`/`price_high` (the scanned window), `location`
-(`above` or `below` the book price), `stop_type`, `concentration_pct` and `distance_pct`; plus
-`retail_sentiment` (`BULLISH`, `BEARISH` or `NEUTRAL`) with `long_order_pct` and `short_order_pct`,
-and `book_time`, the timestamp of the OANDA snapshot.
+On the same page open the **Variables** tab → **New repository variable**:
 
-How the OANDA numbers are derived, since the API does not label order types:
+| Name | Value |
+|---|---|
+| `DATA_BASE_URL` | the folder that holds your CSV files, e.g. `https://raw.githubusercontent.com/<owner>/<repo>/<branch>/<folder>` |
 
-- **Stop clusters.** Buy orders *above* price are buy-stops (stop-losses of shorts) and sell orders
-  *below* price are sell-stops (stop-losses of longs). Buy orders below and sell orders above are
-  entries or take-profits and are ignored. This is an inference: breakout entry stops look the
-  same as protective stops. Adjacent buckets are merged into a window 0.10% of price wide, and the
-  three heaviest windows at least one window apart are reported.
-- **Sentiment.** The share of all pending orders that are buys vs sells: `BULLISH` at 55% or more
-  buys, `BEARISH` at 55% or more sells, otherwise `NEUTRAL`. It reflects pending orders, not open
-  positions.
+This is a *variable*, not a secret, because the URL isn't sensitive. To change the data source later, edit this variable. No code change or commit is needed.
 
-Thresholds are constants at the top of each script (`RANGE_PCT`, `CLUSTER_WIDTH_PCT`,
-`SENTIMENT_THRESHOLD_PCT`, ...).
+If your file names don't match the default (see below), also add the optional variables `M15_FILE_TEMPLATE` and/or `D1_FILE_TEMPLATE`.
 
-## Running locally
+### 4. Turn it on
 
-```bash
-pip install -r requirements.txt
-python scripts/fetch_paxg_dom.py
-OANDA_API_KEY=... OANDA_ACCOUNT_ID=... python scripts/fetch_oanda_book.py
+GitHub only runs scheduled workflows from the repository's **default branch**, so merge this code there first. Then open the **Actions** tab, choose **Forex Scanner**, and click **Run workflow** to test it right away. After that it runs by itself every 15 minutes.
+
+## Data format
+
+For each pair the scanner downloads two files from `DATA_BASE_URL`:
+
+```
+<DATA_BASE_URL>/EURUSD_M15.csv     15-minute bars
+<DATA_BASE_URL>/EURUSD_D1.csv      daily bars
 ```
 
-Each script exits non-zero on failure and writes its file atomically, so a failed run never leaves
-a partial file. In the workflow each fetch runs independently: if one fails, the other's data is
-still committed and the run is then marked failed.
+The 28 pairs are listed in `FOREX_PAIRS` in `data_loader.py`. A pair whose file is missing or unreadable is skipped and listed as a warning in the log and in the Telegram message. It never stops the rest of the scan.
+
+**Different file names.** Set `M15_FILE_TEMPLATE` / `D1_FILE_TEMPLATE` (as repository variables, or as environment variables locally). `{pair}` is replaced by the pair name:
+
+```
+M15_FILE_TEMPLATE={pair}/15m.csv         →  .../EURUSD/15m.csv
+D1_FILE_TEMPLATE=daily/{pair}.txt        →  .../daily/EURUSD.txt
+```
+
+**Columns.** Header names are case-insensitive. You need a timestamp (`datetime`, `timestamp` or `date`, or separate `date` and `time` columns), plus `open, high, low, close` and optionally `volume`:
+
+```csv
+timestamp,open,high,low,close,volume
+2026-10-13 09:45:00,1.16210,1.16255,1.16190,1.16240,812
+```
+
+Comma, semicolon and tab separators are accepted, as are MetaTrader-style `<DATE>,<TIME>,<OPEN>…` headers, header-less `date,time,O,H,L,C,V` files, and Unix-epoch timestamps.
+
+**Time zones and days.** Timestamps without a time zone are treated as UTC, and "today" means the **UTC calendar day** of the newest 15-minute bar. Keep both files in the same time zone.
+
+## How each condition is computed
+
+- **ATR Exhaustion**: today's range is `max(high) - min(low)` over today's 15-minute bars, so it updates intraday. The ATR is pandas-ta's `atr(length=14)` (Wilder smoothing) over *completed* daily bars only, so today doesn't inflate its own benchmark. The alert shows the range and ATR in pips.
+- **Z-Score Divergence**: for each couple in `CORRELATED_PAIRS` (AUDUSD/NZDUSD, EURUSD/GBPUSD, AUDJPY/NZDJPY, EURJPY/GBPJPY, AUDCAD/NZDCAD, AUDCHF/NZDCHF) the spread is `ln(A) - ln(B)` on **15-minute closes**. `z = (latest - mean) / std` over the last 20 bars (sample std). Set `ZSCORE_TIMEFRAME = D1` in `main.py` to use daily closes instead.
+- **Anchored VWAP**: VWAP is anchored at the first bar of today and uses typical price `(H+L+C)/3` weighted by volume. The bands are VWAP ± 3 volume-weighted standard deviations of typical price. The first 8 bars of the day are skipped (`min_bars`), because the bands have almost no width at the open. Forex volume is usually tick volume. If a file has no volume, this condition is skipped for that pair.
+
+To change thresholds, edit the default arguments of the functions in `strategies.py`.
+
+## Run locally
+
+```bash
+python -m venv .venv && source .venv/bin/activate     # Python 3.12+ (pandas-ta requires it)
+pip install -r requirements.txt
+
+export DATA_BASE_URL="https://raw.githubusercontent.com/<owner>/<repo>/<branch>/<folder>"
+python main.py --dry-run          # prints the message instead of sending it
+
+export TELEGRAM_BOT_TOKEN="..." TELEGRAM_CHAT_ID="..."
+python main.py                    # sends it for real
+```
+
+## Reliability
+
+Every outbound request (CSV downloads and the Telegram message) goes through one helper that:
+
+- retries network errors, timeouts, HTTP 408/425/429 and 5xx up to 5 times, with jittered exponential backoff, and obeys the server's `Retry-After` header (capped at 30 s);
+- never retries errors that cannot fix themselves (404, 401, a malformed URL), so those are reported immediately;
+- stops retrying once the 4-minute budget for the whole data load is used up, so an outage cannot hang the job;
+- downloads with 4 parallel workers, which keeps `raw.githubusercontent.com` from rate limiting the shared GitHub runner IPs.
+
+On top of that:
+
+- A file that still fails after its retries is skipped for this run and listed as a warning. The other pairs are scanned normally, and the next run (15 minutes later) tries again.
+- If you paste a `https://github.com/<owner>/<repo>/blob/<branch>/<folder>` page link as `DATA_BASE_URL`, it is converted to the matching raw URL automatically. If a URL returns a web page instead of CSV, the log says so.
+- If Telegram rejects the message formatting, the same text is resent as plain text instead of being dropped.
+- The run fails (red X, GitHub emails you) only when something needs your attention: no data file could be loaded at all, Telegram still refuses the message after its retries, or a strategy crashed.
+
+No software can promise that a request *never* fails. If GitHub or Telegram is down for longer than the retry window, that run reports it and the next scheduled run tries again.
 
 ## Things to know
 
-- **Schedule is best effort.** GitHub may delay or skip `*/15` cron runs under load, so the real
-  cadence is often looser than 15 minutes. Scheduled workflows also pause after 60 days of
-  repository inactivity on public repos.
-- **History grows quickly.** Each change is a commit, up to ~96 per day. If that becomes a
-  problem, publish `data/` to a separate branch or squash periodically.
-- **Binance geo-blocking.** `api.binance.com` returns HTTP 451 to US IP ranges, including
-  GitHub-hosted runners. `fetch_paxg_dom.py` falls back to `data-api.binance.vision`, which serves
-  the same public market data. The file's `source` field shows which host answered.
-- **OANDA snapshot cadence and access.** OANDA publishes order-book snapshots periodically (about
-  every 20 minutes), so consecutive runs can return the same book; compare `book_time`. The
-  endpoint may also be unavailable for some account types or regions.
-- **Public repo, public data.** If this repo is public, the JSON derived from OANDA data is public
-  too. Check OANDA's API terms before publishing it, or keep the repo private.
+- **Repeated alerts.** The scanner is stateless: while a condition stays true, every 15-minute run sends it again. The message header shows the timestamp of the newest bar, so you can tell when the data has gone stale (e.g. over the weekend).
+- **Cron is best-effort.** GitHub may delay or skip scheduled runs when it is busy. In *public* repositories it also pauses schedules after 60 days without repository activity.
+- **Actions minutes.** 96 runs a day is roughly 2,900 minutes a month. That is free for public repositories, but it exceeds the 2,000 free minutes on private repositories on the Free plan.
+- **Caching.** `raw.githubusercontent.com` caches files for about 5 minutes, so updates to your data can take that long to reach the scanner.
+- **Private data repositories** are not supported, since the scanner sends no credentials when fetching CSVs.
