@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import html
+import re
 from collections.abc import Sequence
 
 import pandas as pd
-import requests
 
+from http_utils import RequestFailed, request_with_retry
 from strategies import STRATEGY_ORDER, Signal
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
@@ -69,30 +70,42 @@ def split_message(text: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
     return chunks
 
 
-def send_message(text: str, token: str, chat_id: str, timeout: float = 15) -> None:
+def _post(url: str, payload: dict) -> tuple[int, dict]:
+    """POST with retries; returns ``(status_code, json_body)``."""
+    try:
+        response = request_with_retry("POST", url, json=payload)
+    except RequestFailed as exc:
+        raise NotifierError(f"Telegram request failed: {exc.reason}") from None
+    try:
+        body = response.json()
+    except ValueError:
+        body = {}
+    return response.status_code, body if isinstance(body, dict) else {}
+
+
+def _plain_text(markup: str) -> str:
+    return html.unescape(re.sub(r"</?[a-z][^>]*>", "", markup))
+
+
+def send_message(text: str, token: str, chat_id: str) -> None:
     """Send ``text`` (HTML) to ``chat_id``.
 
     The summary goes out as a single message; it is only split if it is longer
-    than Telegram allows. Errors never include the request URL, which contains
-    the bot token.
+    than Telegram allows. Transient failures (network errors, 429, 5xx) are
+    retried; if Telegram rejects the HTML markup the same text is resent as
+    plain text rather than dropped. Errors never include the request URL, which
+    contains the bot token.
     """
     url = TELEGRAM_API.format(token=token)
     for chunk in split_message(text):
-        payload = {
-            "chat_id": chat_id,
-            "text": chunk,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        try:
-            response = requests.post(url, json=payload, timeout=timeout)
-        except requests.RequestException as exc:
-            raise NotifierError(f"Telegram request failed: {type(exc).__name__}") from None
+        payload = {"chat_id": chat_id, "text": chunk, "parse_mode": "HTML"}
+        status, body = _post(url, payload)
+        description = str(body.get("description", "no description"))
 
-        try:
-            body = response.json()
-        except ValueError:
-            body = {}
-        if response.status_code != 200 or not body.get("ok"):
-            description = body.get("description", "no description")
-            raise NotifierError(f"Telegram API error {response.status_code}: {description}")
+        if status == 400 and "parse entities" in description.lower():
+            payload = {"chat_id": chat_id, "text": _plain_text(chunk)}
+            status, body = _post(url, payload)
+            description = str(body.get("description", "no description"))
+
+        if status != 200 or not body.get("ok"):
+            raise NotifierError(f"Telegram API error {status}: {description}")

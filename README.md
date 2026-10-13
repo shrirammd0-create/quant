@@ -12,6 +12,7 @@ Scans 28 major and minor currency pairs every 15 minutes and sends **one summari
 data_loader.py   fetch + parse CSVs from a raw.githubusercontent.com URL
 strategies.py    the three conditions
 notifier.py      format the summary and send it through the Telegram Bot API
+http_utils.py    shared HTTP helper: retries, backoff, Retry-After, time limit
 main.py          scan the whole universe, send one message if anything matched
 .github/workflows/scanner.yml   runs main.py on cron */15 * * * *
 ```
@@ -98,6 +99,24 @@ python main.py --dry-run          # prints the message instead of sending it
 export TELEGRAM_BOT_TOKEN="..." TELEGRAM_CHAT_ID="..."
 python main.py                    # sends it for real
 ```
+
+## Reliability
+
+Every outbound request (CSV downloads and the Telegram message) goes through one helper that:
+
+- retries network errors, timeouts, HTTP 408/425/429 and 5xx up to 5 times, with jittered exponential backoff, and obeys the server's `Retry-After` header (capped at 30 s);
+- never retries errors that cannot fix themselves (404, 401, a malformed URL), so those are reported immediately;
+- stops retrying once the 4-minute budget for the whole data load is used up, so an outage cannot hang the job;
+- downloads with 4 parallel workers, which keeps `raw.githubusercontent.com` from rate limiting the shared GitHub runner IPs.
+
+On top of that:
+
+- A file that still fails after its retries is skipped for this run and listed as a warning. The other pairs are scanned normally, and the next run (15 minutes later) tries again.
+- If you paste a `https://github.com/<owner>/<repo>/blob/<branch>/<folder>` page link as `DATA_BASE_URL`, it is converted to the matching raw URL automatically. If a URL returns a web page instead of CSV, the log says so.
+- If Telegram rejects the message formatting, the same text is resent as plain text instead of being dropped.
+- The run fails (red X, GitHub emails you) only when something needs your attention: no data file could be loaded at all, Telegram still refuses the message after its retries, or a strategy crashed.
+
+No software can promise that a request *never* fails. If GitHub or Telegram is down for longer than the retry window, that run reports it and the next scheduled run tries again.
 
 ## Things to know
 

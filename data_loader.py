@@ -14,12 +14,15 @@ from __future__ import annotations
 import io
 import logging
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import requests
+
+from http_utils import RequestFailed, request_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +50,10 @@ DEFAULT_FILE_TEMPLATES = {
 # CSVs hold years of history.
 BARS_TO_KEEP = {M15: 2000, D1: 400}
 
-REQUEST_TIMEOUT = 30
-MAX_ATTEMPTS = 3
-RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+# Few workers keep raw.githubusercontent.com from rate limiting (HTTP 429) us;
+# the time budget stops a full outage from stalling the job.
+MAX_WORKERS = 4
+LOAD_TIME_BUDGET = 240  # seconds for the whole universe
 
 OHLC = ["open", "high", "low", "close"]
 _COLUMN_ALIASES = {
@@ -78,6 +82,26 @@ class DataLoadError(Exception):
 MarketData = dict[str, dict[str, pd.DataFrame]]  # data[pair][timeframe] -> OHLCV frame
 
 
+_GITHUB_PAGE_URL = re.compile(r"^https?://github\.com/([^/]+)/([^/]+)/(?:blob|tree|raw)/(.+)$")
+
+
+def normalise_base_url(url: str) -> str:
+    """Tidy a user-supplied base URL so the common mistakes still work.
+
+    Adds a missing ``https://``, strips trailing slashes, and turns a
+    ``github.com/<owner>/<repo>/blob|tree/<branch>/<folder>`` page link (which
+    serves HTML, not CSV) into its ``raw.githubusercontent.com`` equivalent.
+    """
+    url = url.strip().rstrip("/")
+    if url and "://" not in url:
+        url = f"https://{url}"
+    match = _GITHUB_PAGE_URL.match(url)
+    if match:
+        owner, repo, rest = match.groups()
+        url = f"https://raw.githubusercontent.com/{owner}/{repo}/{rest}"
+    return url
+
+
 def file_url(base_url: str, pair: str, timeframe: str) -> str:
     template = (
         os.environ.get(f"{timeframe}_FILE_TEMPLATE") or DEFAULT_FILE_TEMPLATES[timeframe]
@@ -97,23 +121,19 @@ def _session() -> requests.Session:
     return session
 
 
-def fetch_text(url: str) -> str:
-    """GET ``url`` and return the body, retrying transient failures."""
-    failure = "unknown error"
-    for attempt in range(MAX_ATTEMPTS):
-        try:
-            response = _session().get(url, timeout=REQUEST_TIMEOUT)
-        except requests.RequestException as exc:
-            failure = type(exc).__name__
-        else:
-            if response.status_code == 200:
-                return response.content.decode("utf-8-sig", errors="replace")
-            failure = f"HTTP {response.status_code}"
-            if response.status_code not in RETRYABLE_STATUS:
-                break
-        if attempt < MAX_ATTEMPTS - 1:
-            time.sleep(2**attempt)
-    raise DataLoadError(f"{failure} fetching {url}")
+def fetch_text(url: str, deadline: float | None = None) -> str:
+    """GET ``url`` and return the body, retrying transient failures.
+
+    ``deadline`` is a ``time.monotonic()`` value after which no further retry
+    is attempted.
+    """
+    try:
+        response = request_with_retry("GET", url, session=_session(), deadline=deadline)
+    except RequestFailed as exc:
+        raise DataLoadError(f"{exc.reason} fetching {url}") from None
+    if response.status_code != 200:
+        raise DataLoadError(f"HTTP {response.status_code} fetching {url}")
+    return response.content.decode("utf-8-sig", errors="replace")
 
 
 def _timestamps(df: pd.DataFrame) -> pd.Series:
@@ -178,10 +198,16 @@ def parse_ohlcv(text: str) -> pd.DataFrame:
     return out.astype(float)
 
 
-def load_pair(base_url: str, pair: str, timeframe: str) -> pd.DataFrame:
+def load_pair(
+    base_url: str, pair: str, timeframe: str, deadline: float | None = None
+) -> pd.DataFrame:
     """Download and parse one pair/timeframe file."""
     url = file_url(base_url, pair, timeframe)
-    text = fetch_text(url)
+    text = fetch_text(url, deadline)
+    if text.lstrip()[:15].lower().startswith(("<!doctype", "<html")):
+        raise DataLoadError(
+            f"got a web page, not CSV, from {url} (use a raw.githubusercontent.com URL)"
+        )
     try:
         df = parse_ohlcv(text)
     except DataLoadError as exc:
@@ -195,19 +221,26 @@ def load_universe(
     base_url: str,
     pairs: list[str] = FOREX_PAIRS,
     timeframes: tuple[str, ...] = TIMEFRAMES,
-    max_workers: int = 8,
+    max_workers: int = MAX_WORKERS,
+    time_budget: float = LOAD_TIME_BUDGET,
 ) -> tuple[MarketData, dict[str, str]]:
     """Load every pair/timeframe concurrently.
 
     Returns ``(data, errors)``: ``data[pair][timeframe]`` holds the frames that
     loaded, ``errors["PAIR/TF"]`` the reason for each one that did not. A
-    failed file never aborts the rest of the load.
+    failed file never aborts the rest of the load. Once ``time_budget`` seconds
+    have passed, files still failing are not retried any further.
     """
+    fixed_url = normalise_base_url(base_url)
+    if fixed_url != base_url.strip().rstrip("/"):
+        logger.info("Using %s as the data base URL", fixed_url)
+    deadline = time.monotonic() + time_budget
+
     data: MarketData = {pair: {} for pair in pairs}
     errors: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
-            pool.submit(load_pair, base_url, pair, tf): (pair, tf)
+            pool.submit(load_pair, fixed_url, pair, tf, deadline): (pair, tf)
             for pair in pairs
             for tf in timeframes
         }
@@ -217,4 +250,7 @@ def load_universe(
                 data[pair][tf] = future.result()
             except DataLoadError as exc:
                 errors[f"{pair}/{tf}"] = str(exc)
+            except Exception as exc:  # one file's surprise must not abort the scan
+                logger.exception("Unexpected error loading %s/%s", pair, tf)
+                errors[f"{pair}/{tf}"] = f"unexpected {type(exc).__name__}: {exc}"
     return data, errors
